@@ -21,11 +21,13 @@ HyperTrader is an open-source platform that helps you discover **real** profitab
 
 ## Screenshots
 
-> _Screenshots coming soon. Run the platform locally to see the UI._
+> Run the platform locally (`npm start` → http://localhost:3000) to see the full UI.
 
-| Leaderboard | Trader Detail | Simulation |
-|---|---|---|
-| ![Leaderboard](docs/screenshots/leaderboard.png) | ![Detail](docs/screenshots/detail.png) | ![Simulation](docs/screenshots/simulation.png) |
+The dashboard includes:
+- **Leaderboard** — sortable table with score, style, PnL, ROI, account, volume, wins
+- **Trader Detail** — positions, fills, win rate, profit factor, max drawdown, Sharpe, equity curve, per-coin breakdown
+- **Live Tracker** — real-time WebSocket fill stream
+- **Simulation** — paper trading with equity curve, metrics, trade log
 
 ## Quick Start
 
