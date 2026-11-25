@@ -724,7 +724,37 @@ app.listen(PORT, async () => {
   console.log('Server running on http://localhost:' + PORT);
   // auto-refresh recommended wallets after 60s
   setTimeout(() => { refreshRecommended().catch(()=>{}); }, 60000);
-  // no periodic summary; only per-trade notifications
+  // 6-hour summary (opens, closes, profit)
+  let lastSummaryTime = Date.now();
+  setInterval(() => {
+    if (!sim.running) return;
+    let unreal = 0;
+    for (const [c, p] of Object.entries(sim.positions)) {
+      const mid = parseFloat((sim.mids || {})[c] || p.entry || 0);
+      unreal += (mid - p.entry) * p.size;
+    }
+    const eq = sim.cash + unreal;
+    const recentCloses = sim.trades.filter(t => t.type === 'close' && t.t >= lastSummaryTime);
+    const recentOpens = sim.trades.filter(t => t.type === 'open' && t.t >= lastSummaryTime);
+    const realizedPnl = recentCloses.reduce((a, t) => a + (t.pnl || 0), 0);
+    let msg = '📊 <b>6-Hour Summary</b>\\n';
+    msg += 'Equity: $' + eq.toFixed(2) + ' | Cash: $' + sim.cash.toFixed(2) + '\\n';
+    msg += 'Unrealized: $' + unreal.toFixed(2) + ' | Realized: $' + realizedPnl.toFixed(2) + '\\n';
+    msg += 'Open positions: ' + Object.keys(sim.positions).length + ' | Total trades: ' + sim.trades.length + '\\n';
+    if (recentOpens.length > 0) {
+      msg += '\\n📈 <b>Opens (' + recentOpens.length + '):</b>\\n';
+      recentOpens.slice(-10).forEach(t => { msg += '  ' + t.coin + ' ' + t.side + ' ' + Number(t.sz).toFixed(4) + ' @ ' + Number(t.px).toFixed(4) + '\\n'; });
+    }
+    if (recentCloses.length > 0) {
+      msg += '\\n📉 <b>Closes (' + recentCloses.length + '):</b>\\n';
+      recentCloses.slice(-10).forEach(t => { msg += '  ' + t.coin + ' ' + t.side + ' PnL: ' + (t.pnl >= 0 ? '+' : '') + Number(t.pnl).toFixed(4) + '\\n'; });
+    }
+    if (recentOpens.length === 0 && recentCloses.length === 0) {
+      msg += '\\nNo new trades in this period.';
+    }
+    sendTelegram(msg);
+    lastSummaryTime = Date.now();
+  }, 6 * 60 * 60 * 1000); // 6 hours
   // auto-start sim with recommended wallets via internal call
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(__dirname,'..','config','recommended.json'),'utf8'));
