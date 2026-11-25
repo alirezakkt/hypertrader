@@ -8,6 +8,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// keep the process alive on stray async errors (log instead of crash)
+process.on('unhandledRejection', (e) => console.warn('[unhandledRejection]', e && e.message ? e.message : e));
+process.on('uncaughtException', (e) => console.warn('[uncaughtException]', e && e.message ? e.message : e));
+
 const INFO = 'https://api.hyperliquid.xyz/info';
 const LEADERBOARD_URL = 'https://stats-data.hyperliquid.xyz/Mainnet/leaderboard';
 const CACHE_FILE = path.join(__dirname, '..', '.cache', 'leaderboard.json');
@@ -374,11 +378,15 @@ try {
     sim.scale = saved.scale ?? sim.scale;
     sim.cumulativeVolume = saved.cumulativeVolume ?? sim.cumulativeVolume;
     sim.leverage = saved.leverage ?? sim.leverage;
+    if (!sim.mids) sim.mids = {};
+    // never trust persisted "running": connections are gone after restart
+    sim.running = false;
   }
 } catch(e) {}
 function simReset() {
   if (sim.ws) try { sim.ws.close(); } catch(e){}
   sim = { running:false, ws:null, tracked:[], scale:SCALE_SIM, cash:10000, positions:{}, trades:[], equity:[], mids:{}, cumulativeVolume:0, leverage:3, fundingRates:{} };
+  if (!sim.mids) sim.mids = {};
   try { if (fs.existsSync(SIM_FILE)) fs.unlinkSync(SIM_FILE); } catch(e){}
 }
 app.post('/api/sim/start', (req,res) => {
@@ -400,61 +408,46 @@ app.post('/api/sim/start', (req,res) => {
     for (const f of fills) {
       if ((f.time || 0) <= (sim.startTime || 0)) continue;
       f._trader = user;
-      await processSimFill(f, sim);
+      try { await processSimFill(f, sim); } catch(e) { console.warn('[sim] fill err:', e.message); }
     }
   });
+  // robust auto-reconnect loop
+  const connectWs = () => {
+    if (!sim.running) return;
+    let ws2;
+    try { ws2 = new WebSocket('wss://api.hyperliquid.xyz/ws'); } catch(e) { return setTimeout(connectWs, 5000); }
+    sim.ws = ws2;
+    ws2.on('open', () => {
+      console.log('[sim] ws connected');
+      (sim.tracked || []).forEach(a => ws2.send(JSON.stringify({ method:'subscribe', subscription:{ type:'userFills', user:a } })));
+    });
+    ws2.on('message', async (raw) => {
+      let data; try { data = JSON.parse(raw.toString()); } catch(e){ return; }
+      if (data.channel !== 'userFills') return;
+      const d = data.data || {};
+      const user = d.user;
+      const fills = d.fills || (Array.isArray(d) ? d : []);
+      for (const f of fills) {
+        if ((f.time || 0) <= (sim.startTime || 0)) continue;
+        f._trader = user;
+        try { await processSimFill(f, sim); } catch(e) { console.warn('[sim] fill err:', e.message); }
+      }
+    });
+    ws2.on('close', () => { console.log('[sim] ws closed, reconnecting in 5s...'); setTimeout(connectWs, 5000); });
+    ws2.on('error', (e) => { console.log('[sim] ws err', e.message); });
+  };
   ws.on('close', () => {
-    console.log('[sim] ws closed, reconnecting...');
-    setTimeout(() => {
-      if (!sim.running) { sim.running = true; }
-      try {
-        const w2 = new WebSocket('wss://api.hyperliquid.xyz/ws');
-        sim.ws = w2;
-        w2.on('open', () => { console.log('[sim] ws reopened'); sim.tracked.forEach(a=>w2.send(JSON.stringify({method:'subscribe',subscription:{type:'userFills',user:a}}))); });
-        w2.on('message', async (raw) => {
-          let data; try { data=JSON.parse(raw.toString()); } catch(e){return;}
-          if (data.channel !== 'userFills') return;
-          const d = data.data || {};
-          const user = d.user;
-          const fills = d.fills || (Array.isArray(d)?d:[]);
-          for (const f of fills) {
-            if ((f.time || 0) <= (sim.startTime || 0)) continue;
-            f._trader = user;
-            await processSimFill(f, sim);
-          }
-        });
-        w2.on('close', () => { console.log('[sim] ws closed again'); });
-        w2.on('error', (e) => { console.log('[sim] ws err', e.message); });
-      } catch(e) { console.log('[sim] reconnect err', e.message); }
-    }, 3000);
+    console.log('[sim] ws closed, reconnecting in 5s...');
+    setTimeout(connectWs, 5000);
   });
   // mid price refresher
   const seen = new Set();
-  // seed with CURRENT open positions from clearinghouseState (not historical fills)
+  // start flat: only NEW fills after startTime are mirrored (no historical positions)
   (async () => {
-    // fetch mids first
     try {
       const mr = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'allMids'}) });
       sim.mids = await mr.json();
     } catch(e) {}
-    for (const addr of addresses) {
-      try {
-        const r = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'clearinghouseState', user: addr}) });
-        const st = await r.json();
-        const positions = (st && st.assetPositions) ? st.assetPositions : [];
-        for (const p of positions) {
-          const pos = p.position;
-          const coin = pos.coin;
-          const sz = parseFloat(pos.szi);
-          const mid = parseFloat((sim.mids||{})[coin] || pos.entryPx);
-          if (!sim.positions[coin]) sim.positions[coin] = { size: 0, entry: 0 };
-          sim.positions[coin].size += sz * sim.scale;
-          if (sim.positions[coin].entry === 0) sim.positions[coin].entry = mid;
-          else sim.positions[coin].entry = (sim.positions[coin].entry + mid) / 2;
-        }
-      } catch(e) { console.warn('seed err:', e.message); }
-    }
-    console.log('[sim] seeded current positions from', addresses.length, 'wallets. Only new fills will be tracked.');
   })();
 
   if (!sim.fundingRates) sim.fundingRates = {};
@@ -488,7 +481,6 @@ app.post('/api/sim/start', (req,res) => {
         if (upnl < -0.95 * liqThreshold && notional > 0) {
           sim.cash += upnl; // realize loss
           sim.trades.push({ t: Date.now(), coin, side: pos.size>0?'sell':'buy', type:'liquidation', sz: Math.abs(pos.size), px: mid, pnl: Math.round(upnl*100)/100, trader: 'sim' });
-          sendTelegram('🚨 <b>LIQUIDATION</b> ' + coin + '\\nLoss: ' + upnl.toFixed(4));
           pos.size = 0; pos.entry = 0;
         }
       }
@@ -529,7 +521,7 @@ app.get('/api/sim/status', (req,res) => {
   // compute unrealized
   let unreal = 0;
   for (const [coin,pos] of Object.entries(sim.positions)) {
-    const mid = parseFloat(sim.mids[coin]||pos.entry||0);
+    const mid = parseFloat((sim.mids||{})[coin]||pos.entry||0);
     unreal += (mid - pos.entry) * pos.size;
   }
   const equity = sim.cash + unreal;
@@ -594,7 +586,7 @@ function saveSim() {
 async function processSimFill(f, sim) {
   const coin = f.coin;
   const isBuy = f.side === 'B';
-  const sz = parseFloat(f.sz) * sim.scale;
+  let sz = parseFloat(f.sz) * sim.scale;
   const px = parseFloat(f.px);
   const dir = (f.dir || '').toLowerCase();
   const isOpen = dir.includes('open');
@@ -608,6 +600,22 @@ async function processSimFill(f, sim) {
   if (cumVol >= 25e6) feeRate = 0.00035;
   else if (cumVol >= 5e6) feeRate = 0.00040;
   const lev = sim.leverage || 3;
+  // risk cap: keep total open notional <= maxLeverage x equity
+  if (isOpen) {
+    let unrealNow = 0, usedNotional = 0;
+    for (const [c, p] of Object.entries(sim.positions)) {
+      const m = parseFloat((sim.mids || {})[c] || p.entry || 0);
+      unrealNow += (m - p.entry) * p.size;
+      usedNotional += Math.abs(p.size) * m;
+    }
+    const equityNow = sim.cash + unrealNow;
+    const room = Math.max(0, equityNow * (sim.maxLeverage || 2) - usedNotional);
+    const midNow = parseFloat((sim.mids || {})[coin] || px || 0);
+    if (midNow > 0 && sz * midNow > room) {
+      sz = room / midNow;
+      if (sz <= 0) return;
+    }
+  }
   // slippage from L2 book depth
   let slipPx = px;
   try {
@@ -633,7 +641,7 @@ async function processSimFill(f, sim) {
   if (isOpen) {
     const notional = sz * slipPx;
     const marginNeeded = notional / (sim.leverage || 3);
-    const usedMargin = Object.values(sim.positions).reduce((a,p)=>a+Math.abs(p.size)*(sim.mids[p.coin]||p.entry||0)/(sim.leverage||3),0);
+    const usedMargin = Object.values(sim.positions).reduce((a,p)=>a+Math.abs(p.size)*((sim.mids||{})[p.coin]||p.entry||0)/(sim.leverage||3),0);
     if (sim.cash < marginNeeded * 0.5) {
       // insufficient margin, skip
       return;
@@ -648,12 +656,11 @@ async function processSimFill(f, sim) {
     sim.cash -= fee;
     sim.cumulativeVolume = (sim.cumulativeVolume||0) + sz * slipPx;
     sim.trades.push({ t:f.time, coin, side: isBuy?'buy':'sell', type:'open', sz, px: slipPx, fee:Math.round(fee*1e6)/1e6, trader:f._trader });
-    sendTelegram('📈 <b>OPEN</b> ' + (isBuy?'LONG':'SHORT') + ' ' + coin + '\\nSize: ' + sz.toFixed(4) + ' @ ' + slipPx.toFixed(4) + '\\nTrader: ' + (f._trader||'').slice(0,10) + '...');
   } else if (isClose) {
     const closeQty = isBuy ? sz : -sz;
     const qty = Math.min(Math.abs(closeQty), Math.abs(pos.size));
     if (qty <= 0) return; // no position to close, skip
-    const exitPx = isBuy ? px * (1 - slip) : px * (1 + slip);
+    const exitPx = slipPx; // L2-book based, direction already applied
     const pnl = pos.size > 0 ? (exitPx - pos.entry)*qty : (pos.entry - exitPx)*qty;
     const closeFee = qty * exitPx * feeRate;
     sim.cash += pnl - closeFee;
@@ -680,7 +687,7 @@ async function refreshRecommended() {
     const lbRes = await fetch('https://api.hyperliquid.xyz/info'.replace('/info','') + 'stats-data.hyperliquid.xyz/Mainnet/leaderboard'.replace('stats-data.hyperliquid.xyz/Mainnet/leaderboard','stats-data.hyperliquid.xyz/Mainnet/leaderboard'));
   } catch(e) {}
   try {
-    const r = await fetch('http://localhost:' + (process.env.PORT||3000) + '/api/leaderboard?limit=100&onlyReal=true&sortBy=score');
+    const r = await fetch('http://localhost:' + (process.env.PORT||3000) + '/api/leaderboard?limit=500&onlyReal=true&sortBy=score');
     const lb = await r.json();
     const rows = lb.traders || [];
     const out = [];
@@ -689,12 +696,12 @@ async function refreshRecommended() {
         const dRes = await fetch('http://localhost:' + (process.env.PORT||3000) + '/api/trader/' + t.ethAddress);
         const d = await dRes.json();
         const m = d.metrics || {};
-        if ((m.trades||0) < 10) continue;
+        if ((m.trades||0) < 5) continue;
         if ((m.netPnl||0) <= 0) continue;
-        if ((m.winRate||0) < 40) continue;
-        if ((m.maxDrawdownPct||999) > 25) continue;
+        if ((m.winRate||0) < 30) continue;
+        if ((m.maxDrawdownPct||999) > 40) continue;
         out.push(t.ethAddress);
-        if (out.length >= 25) break;
+        if (out.length >= 30) break;
       } catch(e) {}
     }
     if (out.length >= 5) {
@@ -702,6 +709,11 @@ async function refreshRecommended() {
       const fs2 = require('fs');
       const path2 = require('path');
       fs2.writeFileSync(path2.join(__dirname,'..','config','recommended.json'), JSON.stringify(cfg, null, 2));
+      // update sim tracked list dynamically
+      if (sim.running) {
+        sim.tracked = out;
+        console.log('[refresh] updated sim tracked to', out.length, 'wallets');
+      }
       console.log('[refresh] updated recommended wallets:', out.length);
     }
   } catch(e) { console.warn('[refresh] failed:', e.message); }
@@ -723,38 +735,9 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log('Server running on http://localhost:' + PORT);
   // auto-refresh recommended wallets after 60s
-  setTimeout(() => { refreshRecommended().catch(()=>{}); }, 60000);
-  // 6-hour summary (opens, closes, profit)
-  let lastSummaryTime = Date.now();
-  setInterval(() => {
-    if (!sim.running) return;
-    let unreal = 0;
-    for (const [c, p] of Object.entries(sim.positions)) {
-      const mid = parseFloat((sim.mids || {})[c] || p.entry || 0);
-      unreal += (mid - p.entry) * p.size;
-    }
-    const eq = sim.cash + unreal;
-    const recentCloses = sim.trades.filter(t => t.type === 'close' && t.t >= lastSummaryTime);
-    const recentOpens = sim.trades.filter(t => t.type === 'open' && t.t >= lastSummaryTime);
-    const realizedPnl = recentCloses.reduce((a, t) => a + (t.pnl || 0), 0);
-    let msg = '📊 <b>6-Hour Summary</b>\\n';
-    msg += 'Equity: $' + eq.toFixed(2) + ' | Cash: $' + sim.cash.toFixed(2) + '\\n';
-    msg += 'Unrealized: $' + unreal.toFixed(2) + ' | Realized: $' + realizedPnl.toFixed(2) + '\\n';
-    msg += 'Open positions: ' + Object.keys(sim.positions).length + ' | Total trades: ' + sim.trades.length + '\\n';
-    if (recentOpens.length > 0) {
-      msg += '\\n📈 <b>Opens (' + recentOpens.length + '):</b>\\n';
-      recentOpens.slice(-10).forEach(t => { msg += '  ' + t.coin + ' ' + t.side + ' ' + Number(t.sz).toFixed(4) + ' @ ' + Number(t.px).toFixed(4) + '\\n'; });
-    }
-    if (recentCloses.length > 0) {
-      msg += '\\n📉 <b>Closes (' + recentCloses.length + '):</b>\\n';
-      recentCloses.slice(-10).forEach(t => { msg += '  ' + t.coin + ' ' + t.side + ' PnL: ' + (t.pnl >= 0 ? '+' : '') + Number(t.pnl).toFixed(4) + '\\n'; });
-    }
-    if (recentOpens.length === 0 && recentCloses.length === 0) {
-      msg += '\\nNo new trades in this period.';
-    }
-    sendTelegram(msg);
-    lastSummaryTime = Date.now();
-  }, 6 * 60 * 60 * 1000); // 6 hours
+  setTimeout(() => { refreshRecommended().catch(()=>{}); }, 120000);
+  setInterval(() => { refreshRecommended().catch(()=>{}); }, 10 * 60 * 1000);
+  // no periodic summary; only close notifications
   // auto-start sim with recommended wallets via internal call
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(__dirname,'..','config','recommended.json'),'utf8'));
