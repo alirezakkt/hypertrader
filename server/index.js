@@ -385,6 +385,7 @@ app.post('/api/sim/start', (req,res) => {
   if (sim.running) return res.json({ok:false,msg:'already running'});
   const addresses = (req.body && req.body.addresses) || [];
   const scale = parseFloat((req.body && req.body.scale) || SCALE_SIM);
+  sim.startTime = Date.now();
   sim.tracked = addresses; sim.scale = scale; sim.running = true;
   const WebSocket = require('ws');
   const ws = new WebSocket('wss://api.hyperliquid.xyz/ws');
@@ -397,6 +398,7 @@ app.post('/api/sim/start', (req,res) => {
     const user = d.user;
     const fills = d.fills || (Array.isArray(d)?d:[]);
     for (const f of fills) {
+      if ((f.time || 0) <= (sim.startTime || 0)) continue;
       f._trader = user;
       await processSimFill(f, sim);
     }
@@ -415,7 +417,11 @@ app.post('/api/sim/start', (req,res) => {
           const d = data.data || {};
           const user = d.user;
           const fills = d.fills || (Array.isArray(d)?d:[]);
-          for (const f of fills) { f._trader = user; await processSimFill(f, sim); }
+          for (const f of fills) {
+            if ((f.time || 0) <= (sim.startTime || 0)) continue;
+            f._trader = user;
+            await processSimFill(f, sim);
+          }
         });
         w2.on('close', () => { console.log('[sim] ws closed again'); });
         w2.on('error', (e) => { console.log('[sim] ws err', e.message); });
@@ -424,24 +430,31 @@ app.post('/api/sim/start', (req,res) => {
   });
   // mid price refresher
   const seen = new Set();
-  // seed with recent fills (last 20 per wallet) so sim has immediate activity
+  // seed with CURRENT open positions from clearinghouseState (not historical fills)
   (async () => {
+    // fetch mids first
+    try {
+      const mr = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'allMids'}) });
+      sim.mids = await mr.json();
+    } catch(e) {}
     for (const addr of addresses) {
       try {
-        const r = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'userFills', user: addr}) });
-        const fills = await r.json();
-        if (!Array.isArray(fills)) continue;
-        const recent = fills.slice(0, 20).sort((a,b)=>a.time-b.time);
-        for (const f of recent) {
-          const key = addr + ':' + (f.tid || f.oid || f.time);
-          if (seen.has(key)) continue;
-          seen.add(key);
-          f._trader = addr;
-          await processSimFill(f, sim);
+        const r = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'clearinghouseState', user: addr}) });
+        const st = await r.json();
+        const positions = (st && st.assetPositions) ? st.assetPositions : [];
+        for (const p of positions) {
+          const pos = p.position;
+          const coin = pos.coin;
+          const sz = parseFloat(pos.szi);
+          const mid = parseFloat((sim.mids||{})[coin] || pos.entryPx);
+          if (!sim.positions[coin]) sim.positions[coin] = { size: 0, entry: 0 };
+          sim.positions[coin].size += sz * sim.scale;
+          if (sim.positions[coin].entry === 0) sim.positions[coin].entry = mid;
+          else sim.positions[coin].entry = (sim.positions[coin].entry + mid) / 2;
         }
-        fills.forEach(f => seen.add(addr + ':' + (f.tid || f.oid || f.time)));
-      } catch(e) {}
+      } catch(e) { console.warn('seed err:', e.message); }
     }
+    console.log('[sim] seeded current positions from', addresses.length, 'wallets. Only new fills will be tracked.');
   })();
 
   if (!sim.fundingRates) sim.fundingRates = {};
@@ -490,6 +503,7 @@ app.post('/api/sim/start', (req,res) => {
         const fills = await r.json();
         if (!Array.isArray(fills)) continue;
         for (const f of fills) {
+          if ((f.time || 0) <= (sim.startTime || 0)) continue; // only new fills
           const key = addr + ':' + (f.tid || f.oid || f.time);
           if (seen.has(key)) continue;
           seen.add(key);
@@ -548,6 +562,7 @@ app.get('/api/sim/status', (req,res) => {
     running: sim.running,
     tracked: sim.tracked,
     scale: sim.scale,
+    startTime: sim.startTime,
     cash: Math.round(sim.cash*100)/100,
     equity: Math.round(equity*100)/100,
     unrealized: Math.round(unreal*100)/100,
