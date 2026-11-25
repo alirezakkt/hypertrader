@@ -366,6 +366,7 @@ app.post('/api/mirror/stop', (req, res) => {
 // ---- Paper trading simulator ----
 const SCALE_SIM = 0.001;
 let sim = { running:false, ws:null, tracked:[], scale:SCALE_SIM, cash:10000, positions:{}, trades:[], equity:[], mids:{}, cumulativeVolume:0, leverage:3, fundingRates:{} };
+let simWsGen = 0;
 // load persisted sim
 try {
   if (fs.existsSync(SIM_FILE)) {
@@ -384,6 +385,7 @@ try {
   }
 } catch(e) {}
 function simReset() {
+  simWsGen++;
   if (sim.ws) try { sim.ws.close(); } catch(e){}
   sim = { running:false, ws:null, tracked:[], scale:SCALE_SIM, cash:10000, positions:{}, trades:[], equity:[], mids:{}, cumulativeVolume:0, leverage:3, fundingRates:{} };
   if (!sim.mids) sim.mids = {};
@@ -396,28 +398,14 @@ app.post('/api/sim/start', (req,res) => {
   sim.startTime = Date.now();
   sim.tracked = addresses; sim.scale = scale; sim.running = true;
   const WebSocket = require('ws');
-  const ws = new WebSocket('wss://api.hyperliquid.xyz/ws');
-  sim.ws = ws;
-  ws.on('open', () => { addresses.forEach(a=>ws.send(JSON.stringify({method:'subscribe',subscription:{type:'userFills',user:a}}))); });
-  ws.on('message', async (raw) => {
-    let data; try { data=JSON.parse(raw.toString()); } catch(e){return;}
-    if (data.channel !== 'userFills') return;
-    const d = data.data || {};
-    const user = d.user;
-    const fills = d.fills || (Array.isArray(d)?d:[]);
-    for (const f of fills) {
-      if ((f.time || 0) <= (sim.startTime || 0)) continue;
-      f._trader = user;
-      try { await processSimFill(f, sim); } catch(e) { console.warn('[sim] fill err:', e.message); }
-    }
-  });
-  // robust auto-reconnect loop
+  const wsGen = ++simWsGen;
   const connectWs = () => {
-    if (!sim.running) return;
+    if (!sim.running || simWsGen !== wsGen) return;
     let ws2;
     try { ws2 = new WebSocket('wss://api.hyperliquid.xyz/ws'); } catch(e) { return setTimeout(connectWs, 5000); }
     sim.ws = ws2;
     ws2.on('open', () => {
+      if (simWsGen !== wsGen) return;
       console.log('[sim] ws connected');
       (sim.tracked || []).forEach(a => ws2.send(JSON.stringify({ method:'subscribe', subscription:{ type:'userFills', user:a } })));
     });
@@ -433,13 +421,14 @@ app.post('/api/sim/start', (req,res) => {
         try { await processSimFill(f, sim); } catch(e) { console.warn('[sim] fill err:', e.message); }
       }
     });
-    ws2.on('close', () => { console.log('[sim] ws closed, reconnecting in 5s...'); setTimeout(connectWs, 5000); });
+    ws2.on('close', (code, reason) => {
+      if (simWsGen !== wsGen) return;
+      console.log('[sim] ws closed', code, String(reason || ''), '- reconnecting in 5s');
+      setTimeout(connectWs, 5000);
+    });
     ws2.on('error', (e) => { console.log('[sim] ws err', e.message); });
   };
-  ws.on('close', () => {
-    console.log('[sim] ws closed, reconnecting in 5s...');
-    setTimeout(connectWs, 5000);
-  });
+  connectWs();
   // mid price refresher
   const seen = new Set();
   // start flat: only NEW fills after startTime are mirrored (no historical positions)
@@ -558,7 +547,7 @@ app.get('/api/sim/status', (req,res) => {
     cash: Math.round(sim.cash*100)/100,
     equity: Math.round(equity*100)/100,
     unrealized: Math.round(unreal*100)/100,
-    positions: sim.positions,
+    positions: Object.fromEntries(Object.entries(sim.positions).filter(([,p]) => Math.abs(p.size) > 1e-12)),
     trades: sim.trades.slice(-100).reverse(),
     equityHistory: sim.equity.slice(-200),
     mids: sim.mids,
@@ -592,6 +581,7 @@ async function processSimFill(f, sim) {
   const isOpen = dir.includes('open');
   const isClose = dir.includes('close');
   if (!isOpen && !isClose) return;
+  if (isClose && (!sim.positions[coin] || sim.positions[coin].size === 0)) return; // nothing to close
   if (!sim.positions[coin]) sim.positions[coin] = { size:0, entry:0 };
   const pos = sim.positions[coin];
   const cumVol = sim.cumulativeVolume || 0;
