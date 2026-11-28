@@ -1,19 +1,34 @@
 {
   "wallets": [
-    "0x782e432267376f377585fc78092d998f8442ab83",
-    "0x2b804617c6f63c040377e95bb276811747006f4b",
-    "0xaaa57a74209f58208741b4394c48963d179411b3",
-    "0xc72d57b880a988d120141f09328f7daef527a8b0",
-    "0xc3aab477f9279ba2d4697f804518fa91696de042",
-    "0xf5e7ffe523d0491709958490b4877e1d9de6c6f7",
-    "0x8802fdc33b133d36dbd70b774443bf40e89f0d93",
-    "0x747932275df815ae819944e57ebb5b3e115ad68b",
-    "0x4fe09267e2553763a64a1942a57514fe8775ebf0",
-    "0x06453f99650515950478a7f396fb266e33d2e453"
+    "0x5a8b03cc5db1888cb396e7e6e9fea78cb328969b"
   ],
   "scale": 0.001,
   "maxLeverage": 3,
   "maxPositionPct": 0.05,
   "dailyLossLimitPct": 0.02,
-  "maxDrawdownPct": 0.05
+  "maxDrawdownPct": 0.05,
+  "candidates": [
+    {
+      "address": "0x5a8b03cc5db1888cb396e7e6e9fea78cb328969b",
+      "entries": 8,
+      "sizedEntries": 5,
+      "closedOrders": 6,
+      "activeDays": 4,
+      "lastFill": 1795618967751,
+      "modeledDrawdownUsd": 3.65,
+      "modeledRealizedPnl": 1.67,
+      "retainedPnl": 1.22,
+      "modeledNetPnl": 15.25
+    }
+  ],
+  "checked": 60,
+  "unavailable": 0,
+  "updatedAt": 1795622158933,
+  "replay": {
+    "initialEquity": 10000,
+    "maxPositionPct": 0.05,
+    "maxDrawdownPct": 0.05,
+    "network": "mainnet",
+    "reference": true
+  }
 }

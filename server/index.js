@@ -333,17 +333,25 @@ app.get('/api/live', (req, res) => {
 // ---- Mirror control ----
 const { spawn } = require('child_process');
 let mirrorProc = null;
+let mirrorReady = false;
 app.get('/api/mirror/status', (req, res) => {
-  res.json({ running: !!mirrorProc, pid: mirrorProc ? mirrorProc.pid : null });
+  res.json({ running: !!mirrorProc, ready: mirrorReady, pid: mirrorProc ? mirrorProc.pid : null });
 });
 app.post('/api/mirror/start', (req, res) => {
   if (mirrorProc) return res.json({ ok: false, msg: 'already running' });
   const addresses = (req.body && req.body.addresses) || [];
-  const scale = (req.body && req.body.scale) || process.env.HL_SIZE_SCALE || '0.01';
+  const scale = Number(req.body?.scale ?? process.env.HL_SIZE_SCALE ?? 0.001);
+  if (!Array.isArray(addresses) || addresses.length < 1 || addresses.length > 10 ||
+      addresses.some(a => typeof a !== 'string' || !/^0x[0-9a-f]{40}$/i.test(a)) ||
+      !Number.isFinite(scale) || scale <= 0) {
+    return res.status(400).json({ ok: false, msg: 'Enter 1–10 wallet addresses and a positive scale' });
+  }
   const agentKey = (req.body && req.body.agentKey) || process.env.HL_AGENT_KEY;
   const account = (req.body && req.body.account) || process.env.HL_ACCOUNT;
   const testnet = (req.body && req.body.testnet) !== undefined ? req.body.testnet : (process.env.HL_TESTNET !== '0');
   if (!agentKey || !account) return res.json({ ok: false, msg: 'missing agentKey/account' });
+  if (!/^0x[0-9a-f]{40}$/i.test(account) || addresses.some(a => a.toLowerCase() === account.toLowerCase()))
+    return res.status(400).json({ ok: false, msg: 'Check the destination account and exclude it from tracked wallets' });
   const env = Object.assign({}, process.env, {
     HL_TRACK: addresses.join(','),
     HL_SIZE_SCALE: String(scale),
@@ -352,27 +360,58 @@ app.post('/api/mirror/start', (req, res) => {
     HL_TESTNET: testnet ? '1' : '0',
   });
   mirrorProc = spawn('python3', [path.join(__dirname, '..', 'scripts', 'mirror.py')], { env, stdio: ['ignore','pipe','pipe'] });
-  mirrorProc.stdout.on('data', d => console.log('[mirror]', d.toString().trim()));
+  // Reserve user-specific WS slots for execution. The simulator still polls.
+  if (sim.running && sim.ws) sim.ws.close();
+  const lines = require('node:readline').createInterface({ input: mirrorProc.stdout });
+  lines.on('line', line => {
+    if (line === 'MIRROR_READY') mirrorReady = true;
+    if (line === 'MIRROR_DISCONNECTED') mirrorReady = false;
+    console.log('[mirror]', line);
+  });
   mirrorProc.stderr.on('data', d => console.error('[mirror]', d.toString().trim()));
-  mirrorProc.on('exit', () => { mirrorProc = null; });
+  mirrorProc.on('error', e => console.error('[mirror]', e.message));
+  mirrorProc.on('close', () => {
+    mirrorProc = null;
+    mirrorReady = false;
+    if (sim.running) sim._connectWs?.();
+  });
   res.json({ ok: true, pid: mirrorProc.pid });
 });
 app.post('/api/mirror/stop', (req, res) => {
-  if (mirrorProc) { mirrorProc.kill(); mirrorProc = null; }
+  if (mirrorProc) { mirrorProc.kill(); }
   res.json({ ok: true });
 });
 
 
 // ---- Paper trading simulator ----
 const SCALE_SIM = 0.001;
-let sim = { running:false, ws:null, tracked:[], scale:SCALE_SIM, cash:10000, positions:{}, trades:[], equity:[], mids:{}, cumulativeVolume:0, leverage:3, fundingRates:{} };
+let sim = { running:false, ws:null, tracked:[], scale:SCALE_SIM, cash:10000, positions:{}, books:{}, trades:[], equity:[], mids:{}, cumulativeVolume:0, leverage:3, fundingRates:{}, stats:null };
+const emptyStats = () => ({ opens:0, closes:0, wins:0, losses:0, grossWin:0, grossLoss:0, fees:0, realized:0 });
+function aggregateBooks() {
+  const agg = {};
+  for (const book of Object.values(sim.books || {})) {
+    for (const [coin, p] of Object.entries(book || {})) {
+      if (!p || !p.size) continue;
+      const a = agg[coin] || (agg[coin] = { size:0, entry:0 });
+      const newSize = a.size + p.size;
+      if (a.size === 0) a.entry = p.entry;
+      else if (Math.sign(a.size) === Math.sign(p.size)) a.entry = (a.entry*Math.abs(a.size) + p.entry*Math.abs(p.size)) / (Math.abs(a.size)+Math.abs(p.size));
+      a.size = newSize;
+      if (Math.abs(a.size) < 1e-12) { a.size = 0; a.entry = 0; }
+    }
+  }
+  sim.positions = agg;
+  return agg;
+}
 let simWsGen = 0;
 // load persisted sim
 try {
   if (fs.existsSync(SIM_FILE)) {
     const saved = JSON.parse(fs.readFileSync(SIM_FILE,'utf8'));
     sim.cash = saved.cash ?? sim.cash;
+    sim.books = saved.books ?? {};
     sim.positions = saved.positions ?? sim.positions;
+    sim.stats = saved.stats ?? emptyStats();
     sim.trades = saved.trades ?? sim.trades;
     sim.equity = saved.equity ?? sim.equity;
     sim.tracked = saved.tracked ?? sim.tracked;
@@ -384,10 +423,18 @@ try {
     sim.running = false;
   }
 } catch(e) {}
-function simReset() {
+function stopSim() {
   simWsGen++;
-  if (sim.ws) try { sim.ws.close(); } catch(e){}
-  sim = { running:false, ws:null, tracked:[], scale:SCALE_SIM, cash:10000, positions:{}, trades:[], equity:[], mids:{}, cumulativeVolume:0, leverage:3, fundingRates:{} };
+  sim.running = false;
+  clearInterval(sim._midIv);
+  clearInterval(sim._pollIv);
+  clearTimeout(sim._reconnectTimer);
+  sim.ws?.close();
+  sim.ws = null;
+}
+function simReset() {
+  stopSim();
+  sim = { running:false, ws:null, tracked:[], scale:SCALE_SIM, cash:10000, positions:{}, books:{}, trades:[], equity:[], mids:{}, cumulativeVolume:0, leverage:3, fundingRates:{}, stats:emptyStats() };
   if (!sim.mids) sim.mids = {};
   try { if (fs.existsSync(SIM_FILE)) fs.unlinkSync(SIM_FILE); } catch(e){}
 }
@@ -395,103 +442,133 @@ app.post('/api/sim/start', (req,res) => {
   if (sim.running) return res.json({ok:false,msg:'already running'});
   const addresses = (req.body && req.body.addresses) || [];
   const scale = parseFloat((req.body && req.body.scale) || SCALE_SIM);
-  sim.startTime = Date.now();
+  const startTime = Date.now();
+  sim.startTime = startTime;
+  sim.useRecommended = req.body?.useRecommended === true;
   sim.tracked = addresses; sim.scale = scale; sim.running = true;
   const WebSocket = require('ws');
   const wsGen = ++simWsGen;
+  const isCurrent = () => sim.running && simWsGen === wsGen;
+  const seen = new Set();
+  let pendingFills = Promise.resolve();
+  const enqueueFill = (user, fill) => {
+    if (!isCurrent() || !user || (fill.time || 0) <= startTime) return;
+    if (!sim.tracked.some(addr => addr.toLowerCase() === user.toLowerCase())) return;
+    const id = fill.tid ?? [fill.oid, fill.time, fill.coin, fill.side, fill.px, fill.sz].join(':');
+    const key = `${user.toLowerCase()}:${id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pendingFills = pendingFills.then(() => {
+      if (isCurrent()) return processSimFill({ ...fill, _trader: user }, sim, isCurrent);
+    }).catch(e => console.warn('[sim] fill err:', e.message));
+  };
+  const scheduleReconnect = () => {
+    sim._reconnectTimer = setTimeout(connectWs, 5000);
+  };
   const connectWs = () => {
-    if (!sim.running || simWsGen !== wsGen) return;
+    if (!isCurrent() || mirrorProc || (sim.ws && sim.ws.readyState < 2)) return;
     let ws2;
-    try { ws2 = new WebSocket('wss://api.hyperliquid.xyz/ws'); } catch(e) { return setTimeout(connectWs, 5000); }
+    try { ws2 = new WebSocket('wss://api.hyperliquid.xyz/ws'); } catch(e) { return scheduleReconnect(); }
     sim.ws = ws2;
     ws2.on('open', () => {
-      if (simWsGen !== wsGen) return;
+      if (!isCurrent()) return;
       console.log('[sim] ws connected');
       (sim.tracked || []).forEach(a => ws2.send(JSON.stringify({ method:'subscribe', subscription:{ type:'userFills', user:a } })));
     });
-    ws2.on('message', async (raw) => {
+    ws2.on('message', (raw) => {
       let data; try { data = JSON.parse(raw.toString()); } catch(e){ return; }
       if (data.channel !== 'userFills') return;
       const d = data.data || {};
       const user = d.user;
       const fills = d.fills || (Array.isArray(d) ? d : []);
-      for (const f of fills) {
-        if ((f.time || 0) <= (sim.startTime || 0)) continue;
-        f._trader = user;
-        try { await processSimFill(f, sim); } catch(e) { console.warn('[sim] fill err:', e.message); }
-      }
+      for (const fill of fills) enqueueFill(user, fill);
     });
     ws2.on('close', (code, reason) => {
-      if (simWsGen !== wsGen) return;
+      if (!isCurrent()) return;
+      if (sim.ws !== ws2) return;
+      sim.ws = null;
+      if (mirrorProc) return;
       console.log('[sim] ws closed', code, String(reason || ''), '- reconnecting in 5s');
-      setTimeout(connectWs, 5000);
+      scheduleReconnect();
     });
     ws2.on('error', (e) => { console.log('[sim] ws err', e.message); });
   };
+  sim._connectWs = connectWs;
   connectWs();
   // mid price refresher
-  const seen = new Set();
   // start flat: only NEW fills after startTime are mirrored (no historical positions)
   (async () => {
     try {
       const mr = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'allMids'}) });
-      sim.mids = await mr.json();
+      const mids = await mr.json();
+      if (isCurrent() && mr.ok) sim.mids = mids;
     } catch(e) {}
   })();
 
   if (!sim.fundingRates) sim.fundingRates = {};
   const midIv = setInterval(async () => {
-    if (!sim.running) { clearInterval(midIv); return; }
+    if (!isCurrent()) return;
     try {
       const r = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'allMids'}) });
-      sim.mids = await r.json();
+      const mids = await r.json();
+      if (isCurrent() && r.ok) sim.mids = mids;
     } catch(e){}
+    if (!isCurrent()) return;
     // funding rates + accrual
     try {
       const r2 = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'metaAndAssetCtxs'}) });
       const d2 = await r2.json();
+      if (!isCurrent() || !r2.ok) return;
       const meta = d2[0], ctxs = d2[1];
       (meta.universe || []).forEach((a,i) => {
         const ctx = ctxs[i] || {};
         sim.fundingRates[a.name] = parseFloat(ctx.funding || 0);
       });
-      // accrue funding (rate is per hour; 5s interval -> /720)
-      for (const [coin,pos] of Object.entries(sim.positions)) {
-        if (!pos.size) continue;
-        const rate = sim.fundingRates[coin] || 0;
-        const mid = parseFloat((sim.mids||{})[coin] || pos.entry);
-        const payment = pos.size * mid * rate / 720;
-        sim.cash -= payment;
-        // liquidation check: if unrealized loss > 80% of notional, liquidate
-        const notional = Math.abs(pos.size) * mid;
-        const upnl = (mid - pos.entry) * pos.size;
-        const lev = sim.leverage || 3;
-        const liqThreshold = notional / lev; // liquidate when loss exceeds 1/leverage of notional
-        if (upnl < -0.95 * liqThreshold && notional > 0) {
-          sim.cash += upnl; // realize loss
-          sim.trades.push({ t: Date.now(), coin, side: pos.size>0?'sell':'buy', type:'liquidation', sz: Math.abs(pos.size), px: mid, pnl: Math.round(upnl*100)/100, trader: 'sim' });
-          pos.size = 0; pos.entry = 0;
+      // accrue funding + liquidation check per trader sub-book
+      for (const book of Object.values(sim.books || {})) {
+        for (const [coin,pos] of Object.entries(book || {})) {
+          if (!pos.size) continue;
+          const rate = sim.fundingRates[coin] || 0;
+          const mid = parseFloat((sim.mids||{})[coin] || pos.entry);
+          const payment = pos.size * mid * rate / 720;
+          sim.cash -= payment;
+          if (!sim.stats) sim.stats = emptyStats();
+          sim.stats.fees += payment;
+          const notional = Math.abs(pos.size) * mid;
+          const upnl = (mid - pos.entry) * pos.size;
+          const lev = sim.leverage || 3;
+          const liqThreshold = notional / lev; // liquidate when loss exceeds 1/leverage of notional
+          if (upnl < -0.95 * liqThreshold && notional > 0) {
+            sim.cash += upnl; // realize loss
+            sim.stats.closes++;
+            sim.stats.realized += upnl;
+            if (upnl < 0) { sim.stats.losses++; sim.stats.grossLoss += Math.abs(upnl); }
+            sim.trades.push({ t: Date.now(), coin, side: pos.size>0?'sell':'buy', type:'liquidation', sz: Math.abs(pos.size), px: mid, pnl: Math.round(upnl*100)/100, trader: 'sim' });
+            pos.size = 0; pos.entry = 0;
+          }
         }
       }
+      aggregateBooks();
     } catch(e){}
   }, 5000);
   // polling fallback to catch fills the WS misses
+  let polling = false;
   const pollIv = setInterval(async () => {
-    if (!sim.running) { clearInterval(pollIv); return; }
-    for (const addr of sim.tracked) {
-      try {
-        const r = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'userFills', user: addr}) });
-        const fills = await r.json();
-        if (!Array.isArray(fills)) continue;
-        for (const f of fills) {
-          if ((f.time || 0) <= (sim.startTime || 0)) continue; // only new fills
-          const key = addr + ':' + (f.tid || f.oid || f.time);
-          if (seen.has(key)) continue;
-          seen.add(key);
-          f._trader = addr;
-          await processSimFill(f, sim);
-        }
-      } catch(e) {}
+    if (!isCurrent() || polling) return;
+    polling = true;
+    try {
+      for (const addr of sim.tracked) {
+        if (!isCurrent()) break;
+        try {
+          const r = await fetch(INFO, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'userFills', user: addr}), signal: AbortSignal.timeout(10000) });
+          if (!r.ok) continue;
+          const fills = await r.json();
+          if (!Array.isArray(fills)) continue;
+          for (const fill of fills.sort((a, b) => a.time - b.time)) enqueueFill(addr, fill);
+        } catch(e) {}
+      }
+    } finally {
+      polling = false;
     }
   }, 30000);
   sim._pollIv = pollIv;
@@ -499,39 +576,39 @@ app.post('/api/sim/start', (req,res) => {
   res.json({ok:true});
 });
 app.post('/api/sim/stop', (req,res) => {
-  sim.running = false;
-  if (sim.ws) try { sim.ws.close(); } catch(e){}
-  if (sim._midIv) clearInterval(sim._midIv);
-  if (sim._pollIv) clearInterval(sim._pollIv);
+  stopSim();
   res.json({ok:true});
 });
 app.post('/api/sim/reset', (req,res) => { simReset(); res.json({ok:true}); });
 app.get('/api/sim/status', (req,res) => {
-  // compute unrealized
+  aggregateBooks();
+  // compute unrealized from per-trader sub-books
   let unreal = 0;
-  for (const [coin,pos] of Object.entries(sim.positions)) {
-    const mid = parseFloat((sim.mids||{})[coin]||pos.entry||0);
-    unreal += (mid - pos.entry) * pos.size;
+  for (const book of Object.values(sim.books || {})) {
+    for (const [coin,pos] of Object.entries(book || {})) {
+      if (!pos.size) continue;
+      const mid = parseFloat((sim.mids||{})[coin]||pos.entry||0);
+      unreal += (mid - pos.entry) * pos.size;
+    }
   }
   const equity = sim.cash + unreal;
-  // metrics
-  let grossWin=0, grossLoss=0, wins=0, losses=0;
-  const rets=[];
-  let cum=0, peak=0, maxDD=0;
-  const sorted=[...sim.trades].sort((a,b)=>a.t-b.t);
-  for (const t of sorted) {
-    if (t.type!=='close') continue;
-    const p = (t.pnl||0);
-    if (p>0){wins++;grossWin+=p;} else if(p<0){losses++;grossLoss+=Math.abs(p);}
-    cum += p;
-    if (cum>peak) peak=cum;
-    const dd = peak-cum;
-    if (dd>maxDD) maxDD=dd;
-    rets.push(p);
-  }
+  // all-time metrics from counters (trade list itself is capped)
+  const st = sim.stats || emptyStats();
+  const wins = st.wins, losses = st.losses;
+  const grossWin = st.grossWin, grossLoss = st.grossLoss;
   const pf = grossLoss>0 ? grossWin/grossLoss : (grossWin>0?999:0);
   const wr = (wins+losses)>0 ? wins/(wins+losses)*100 : 0;
-  // sharpe
+  // drawdown / sharpe from realized equity curve
+  const rets = [];
+  let peak = 10000, maxDD = 0;
+  for (const e of (sim.equity || [])) {
+    const v = Number(e.cash) || 0;
+    if (v > peak) peak = v;
+    if (peak - v > maxDD) maxDD = peak - v;
+  }
+  if (equity > peak) peak = equity;
+  if (peak - equity > maxDD) maxDD = peak - equity;
+  for (const t of sim.trades) if (t.type === 'close' && t.pnl) rets.push(t.pnl);
   let sharpe=0;
   if (rets.length>1) {
     const mean = rets.reduce((a,b)=>a+b,0)/rets.length;
@@ -552,7 +629,7 @@ app.get('/api/sim/status', (req,res) => {
     equityHistory: sim.equity.slice(-200),
     mids: sim.mids,
     metrics: {
-      trades: sim.trades.length,
+      trades: st.opens + st.closes,
       closes: wins+losses,
       wins, losses,
       winRate: Math.round(wr*100)/100,
@@ -561,6 +638,7 @@ app.get('/api/sim/status', (req,res) => {
       sharpe: Math.round(sharpe*100)/100,
       grossWin: Math.round(grossWin*100)/100,
       grossLoss: Math.round(grossLoss*100)/100,
+      fees: Math.round((st.fees||0)*100)/100,
       netPnl: Math.round((sim.cash-10000)*100)/100,
     }
   });
@@ -569,10 +647,10 @@ app.get('/api/sim/status', (req,res) => {
 function saveSim() {
   try {
     fs.mkdirSync(path.dirname(SIM_FILE), { recursive: true });
-    fs.writeFileSync(SIM_FILE, JSON.stringify({ cash:sim.cash, positions:sim.positions, trades:sim.trades.slice(-500), equity:sim.equity.slice(-500), tracked:sim.tracked, scale:sim.scale, running:sim.running, cumulativeVolume:sim.cumulativeVolume, leverage:sim.leverage }));
+    fs.writeFileSync(SIM_FILE, JSON.stringify({ cash:sim.cash, books:sim.books, stats:sim.stats, positions:sim.positions, trades:sim.trades.slice(-500), equity:sim.equity.slice(-500), tracked:sim.tracked, scale:sim.scale, running:sim.running, cumulativeVolume:sim.cumulativeVolume, leverage:sim.leverage }));
   } catch(e) {}
 }
-async function processSimFill(f, sim) {
+async function processSimFill(f, sim, isCurrent) {
   const coin = f.coin;
   const isBuy = f.side === 'B';
   let sz = parseFloat(f.sz) * sim.scale;
@@ -581,22 +659,35 @@ async function processSimFill(f, sim) {
   const isOpen = dir.includes('open');
   const isClose = dir.includes('close');
   if (!isOpen && !isClose) return;
-  if (isClose && (!sim.positions[coin] || sim.positions[coin].size === 0)) return; // nothing to close
-  if (!sim.positions[coin]) sim.positions[coin] = { size:0, entry:0 };
-  const pos = sim.positions[coin];
+  if (!Number.isFinite(sz) || sz <= 0 || !Number.isFinite(px) || px <= 0) return;
+
+  // Each tracked trader has its own sub-book. Closes never touch another
+  // trader's position, and a close for a position we never opened is ignored.
+  const trader = f._trader || 'unknown';
+  if (!sim.books) sim.books = {};
+  if (!sim.stats) sim.stats = emptyStats();
+  const book = sim.books[trader] || (sim.books[trader] = {});
+  const pos = book[coin] || (book[coin] = { size:0, entry:0 });
+  if (isClose && pos.size === 0) return;
+  // a close fill must be opposite to the position it closes
+  if (isClose && ((pos.size > 0 && isBuy) || (pos.size < 0 && !isBuy))) return;
+  if (!isCurrent()) return;
+
   const cumVol = sim.cumulativeVolume || 0;
-  // fee tier based on cumulative volume
   let feeRate = 0.00045;
   if (cumVol >= 25e6) feeRate = 0.00035;
   else if (cumVol >= 5e6) feeRate = 0.00040;
-  const lev = sim.leverage || 3;
-  // risk cap: keep total open notional <= maxLeverage x equity
+
+  // risk cap: keep total open notional across all sub-books <= maxLeverage x equity
   if (isOpen) {
     let unrealNow = 0, usedNotional = 0;
-    for (const [c, p] of Object.entries(sim.positions)) {
-      const m = parseFloat((sim.mids || {})[c] || p.entry || 0);
-      unrealNow += (m - p.entry) * p.size;
-      usedNotional += Math.abs(p.size) * m;
+    for (const b of Object.values(sim.books)) {
+      for (const [c, p] of Object.entries(b || {})) {
+        if (!p.size) continue;
+        const m = parseFloat((sim.mids || {})[c] || p.entry || 0);
+        unrealNow += (m - p.entry) * p.size;
+        usedNotional += Math.abs(p.size) * m;
+      }
     }
     const equityNow = sim.cash + unrealNow;
     const room = Math.max(0, equityNow * (sim.maxLeverage || 2) - usedNotional);
@@ -606,37 +697,11 @@ async function processSimFill(f, sim) {
       if (sz <= 0) return;
     }
   }
-  // slippage from L2 book depth
-  let slipPx = px;
-  try {
-    const bookRes = await fetch('https://api.hyperliquid.xyz/info', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'l2Book', coin}) });
-    const book = await bookRes.json();
-    const levels = book.levels || [[],[]];
-    const sideLevels = isBuy ? levels[1] : levels[0]; // asks for buy, bids for sell
-    let remaining = sz;
-    let cost = 0;
-    for (const lvl of sideLevels) {
-      const p = parseFloat(lvl.px);
-      const s = parseFloat(lvl.sz);
-      const take = Math.min(remaining, s);
-      cost += take * p;
-      remaining -= take;
-      if (remaining <= 0) break;
-    }
-    if (remaining <= 0 && sz > 0) slipPx = cost / sz;
-    else slipPx = isBuy ? px * 1.001 : px * 0.999;
-  } catch(e) { slipPx = isBuy ? px * 1.001 : px * 0.999; }
+
+  // copy latency: small adverse slippage instead of a stale L2 snapshot
+  const slipPx = isBuy ? px * 1.0003 : px * 0.9997;
   const fee = sz * slipPx * feeRate;
-  // margin check
-  if (isOpen) {
-    const notional = sz * slipPx;
-    const marginNeeded = notional / (sim.leverage || 3);
-    const usedMargin = Object.values(sim.positions).reduce((a,p)=>a+Math.abs(p.size)*((sim.mids||{})[p.coin]||p.entry||0)/(sim.leverage||3),0);
-    if (sim.cash < marginNeeded * 0.5) {
-      // insufficient margin, skip
-      return;
-    }
-  }
+
   if (isOpen) {
     if (pos.size === 0) pos.entry = slipPx;
     else if ((pos.size > 0) === isBuy) {
@@ -644,23 +709,32 @@ async function processSimFill(f, sim) {
     }
     pos.size += isBuy ? sz : -sz;
     sim.cash -= fee;
-    sim.cumulativeVolume = (sim.cumulativeVolume||0) + sz * slipPx;
-    sim.trades.push({ t:f.time, coin, side: isBuy?'buy':'sell', type:'open', sz, px: slipPx, fee:Math.round(fee*1e6)/1e6, trader:f._trader });
-  } else if (isClose) {
+    sim.cumulativeVolume = cumVol + sz * slipPx;
+    sim.stats.opens++;
+    sim.stats.fees += fee;
+    sim.trades.push({ t:f.time, coin, side: isBuy?'buy':'sell', type:'open', sz, px: slipPx, fee:Math.round(fee*1e6)/1e6, trader });
+  } else {
     const closeQty = isBuy ? sz : -sz;
     const qty = Math.min(Math.abs(closeQty), Math.abs(pos.size));
-    if (qty <= 0) return; // no position to close, skip
-    const exitPx = slipPx; // L2-book based, direction already applied
+    if (qty <= 0) return;
+    const exitPx = slipPx;
     const pnl = pos.size > 0 ? (exitPx - pos.entry)*qty : (pos.entry - exitPx)*qty;
     const closeFee = qty * exitPx * feeRate;
-    sim.cash += pnl - closeFee;
+    const net = pnl - closeFee;
+    sim.cash += net;
     sim.cumulativeVolume = (sim.cumulativeVolume||0) + qty * exitPx;
     pos.size -= pos.size > 0 ? qty : -qty;
     if (Math.abs(pos.size) < 1e-9) { pos.size = 0; pos.entry = 0; }
-    sim.trades.push({ t:f.time, coin, side: isBuy?'buy':'sell', type:'close', sz:qty, px: exitPx, pnl:Math.round((pnl-closeFee)*100)/100, fee:Math.round(closeFee*1e6)/1e6, trader:f._trader });
-    const pnlStr = (pnl-closeFee) >= 0 ? '✅' : '❌';
-    sendTelegram(pnlStr + ' <b>CLOSE</b> ' + coin + '\\n' + (isBuy?'Buy':'Sell') + ' ' + qty.toFixed(4) + ' @ ' + exitPx.toFixed(4) + '\\nPnL: ' + (pnl-closeFee).toFixed(4) + ' | Fee: ' + closeFee.toFixed(4));
+    sim.stats.closes++;
+    sim.stats.fees += closeFee;
+    sim.stats.realized += net;
+    if (net > 0) { sim.stats.wins++; sim.stats.grossWin += net; }
+    else if (net < 0) { sim.stats.losses++; sim.stats.grossLoss += Math.abs(net); }
+    sim.trades.push({ t:f.time, coin, side: isBuy?'buy':'sell', type:'close', sz:qty, px: exitPx, pnl:Math.round(net*100)/100, fee:Math.round(closeFee*1e6)/1e6, trader });
+    const pnlStr = net >= 0 ? '✅' : '❌';
+    sendTelegram(pnlStr + ' <b>CLOSE</b> ' + coin + '\n' + (isBuy?'Buy':'Sell') + ' ' + qty.toFixed(4) + ' @ ' + exitPx.toFixed(4) + '\nPnL: ' + net.toFixed(4) + ' | Fee: ' + closeFee.toFixed(4));
   }
+  aggregateBooks();
   sim.equity.push({ t: Date.now(), cash: Math.round(sim.cash*100)/100 });
   if (sim.equity.length > 500) sim.equity.shift();
   saveSim();
@@ -672,50 +746,128 @@ app.get('/api/health', (req,res) => {
 });
 
 // Refresh recommended wallets from live leaderboard
-async function refreshRecommended() {
-  try {
-    const lbRes = await fetch('https://api.hyperliquid.xyz/info'.replace('/info','') + 'stats-data.hyperliquid.xyz/Mainnet/leaderboard'.replace('stats-data.hyperliquid.xyz/Mainnet/leaderboard','stats-data.hyperliquid.xyz/Mainnet/leaderboard'));
-  } catch(e) {}
-  try {
-    const r = await fetch('http://localhost:' + (process.env.PORT||3000) + '/api/leaderboard?limit=500&onlyReal=true&sortBy=score');
-    const lb = await r.json();
-    const rows = lb.traders || [];
-    const out = [];
-    for (const t of rows) {
-      try {
-        const dRes = await fetch('http://localhost:' + (process.env.PORT||3000) + '/api/trader/' + t.ethAddress);
-        const d = await dRes.json();
-        const m = d.metrics || {};
-        if ((m.trades||0) < 5) continue;
-        if ((m.netPnl||0) <= 0) continue;
-        if ((m.winRate||0) < 30) continue;
-        if ((m.maxDrawdownPct||999) > 40) continue;
-        out.push(t.ethAddress);
-        if (out.length >= 30) break;
-      } catch(e) {}
-    }
-    if (out.length >= 5) {
-      const cfg = { wallets: out, scale: 0.001, maxLeverage: 3, maxPositionPct: 0.05, dailyLossLimitPct: 0.02, maxDrawdownPct: 0.05 };
-      const fs2 = require('fs');
-      const path2 = require('path');
-      fs2.writeFileSync(path2.join(__dirname,'..','config','recommended.json'), JSON.stringify(cfg, null, 2));
-      // update sim tracked list dynamically
-      if (sim.running) {
-        sim.tracked = out;
-        console.log('[refresh] updated sim tracked to', out.length, 'wallets');
-      }
-      console.log('[refresh] updated recommended wallets:', out.length);
-    }
-  } catch(e) { console.warn('[refresh] failed:', e.message); }
+const { evaluateCandidate } = require('./copy-candidates');
+const recommendedFile = path.join(__dirname, '..', 'config', 'recommended.json');
+let refreshInFlight;
+let refreshKey;
+
+async function destinationInfo(url, body) {
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error('Destination data unavailable (HTTP ' + response.status + ')');
+  return response.json();
 }
-app.post('/api/recommended/refresh', async (req,res) => {
-  await refreshRecommended();
-  res.json({ ok: true });
+
+async function findRecommended(scale, testnet = false, account = '') {
+  const cfg = JSON.parse(fs.readFileSync(recommendedFile, 'utf8'));
+  scale ??= cfg.scale ?? SCALE_SIM;
+  const url = testnet ? 'https://api.hyperliquid-testnet.xyz/info' : INFO;
+  const [meta, state] = await Promise.all([
+    destinationInfo(url, { type: 'meta' }),
+    account ? destinationInfo(url, { type: 'clearinghouseState', user: account }) : null,
+  ]);
+  const initialEquity = account ? Number(state?.marginSummary?.accountValue) : 10000;
+  if (!Number.isFinite(initialEquity) || initialEquity <= 0) throw new Error('No positive perpetual account equity on the selected network');
+  const maxPositionPct = Number(process.env.HL_MAX_POSITION_PCT || 0.05);
+  const maxDrawdownPct = Number(cfg.maxDrawdownPct ?? 0.05);
+  if (!(Number.isFinite(maxPositionPct) && maxPositionPct > 0 && maxDrawdownPct > 0 && maxDrawdownPct <= 1))
+    throw new Error('Invalid position or drawdown limit');
+  const replay = { initialEquity, maxPositionPct, maxDrawdownPct, network: testnet ? 'testnet' : 'mainnet', reference: !account };
+  const sizeDecimals = new Map(meta.universe.filter(a => !a.isDelisted && Number.isInteger(a.szDecimals))
+    .map(a => [a.name, a.szDecimals]));
+  const profile = { ...replay, sizeDecimals, scale };
+  const leaderboard = await fetch(LEADERBOARD_URL, { signal: AbortSignal.timeout(60000) });
+  if (!leaderboard.ok) throw new Error('Leaderboard unavailable (HTTP ' + leaderboard.status + ')');
+  const { leaderboardRows } = await leaderboard.json();
+  const candidates = leaderboardRows.map(scoreRow)
+    .filter(t => t.ethAddress.toLowerCase() !== account && t.recentPositive && t.pnl.allTime > 0 && t.vlm.week >= 1000 && t.accountValue > 0)
+    .sort((a, b) => b.score - a.score);
+  const picks = [];
+  let checked = 0, unavailable = 0, consecutiveFailures = 0;
+  for (const candidate of candidates.slice(0, 60)) {
+    let history;
+    try {
+      const response = await fetch(INFO, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'userFills', user: candidate.ethAddress, aggregateByTime: true }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) throw new Error('Fill history unavailable (HTTP ' + response.status + ')');
+      history = await response.json();
+      if (!Array.isArray(history)) throw new Error('Invalid fill history');
+    } catch (e) {
+      unavailable++;
+      if (++consecutiveFailures >= 3) {
+        if (!checked) throw e;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 6000));
+      continue;
+    }
+    consecutiveFailures = 0;
+    const metrics = evaluateCandidate(history, profile);
+    checked++;
+    if (metrics) picks.push({ address: candidate.ethAddress, ...metrics });
+
+    // Large fill histories cost additional API weight.
+    await new Promise(resolve => setTimeout(resolve, 1500 + 3 * history.length));
+  }
+  picks.sort((a, b) => b.retainedPnl - a.retainedPnl || a.modeledDrawdownUsd - b.modeledDrawdownUsd);
+  const eligible = picks.slice(0, 10);
+  const result = { ...cfg, scale, replay, wallets: eligible.map(p => p.address), candidates: eligible, checked, unavailable, updatedAt: Date.now() };
+  if (account || testnet || scale !== Number(cfg.scale ?? SCALE_SIM)) return result;
+  fs.writeFileSync(recommendedFile + '.tmp', JSON.stringify(result, null, 2));
+  fs.renameSync(recommendedFile + '.tmp', recommendedFile);
+  if (sim.running && sim.useRecommended) {
+    const next = new Set(result.wallets.map(a => a.toLowerCase()));
+    const previous = new Set(sim.tracked.map(a => a.toLowerCase()));
+    sim.tracked = result.wallets;
+    if (sim.ws?.readyState === 1) {
+      const subscribe = (method, user) => sim.ws.send(JSON.stringify({ method, subscription: { type: 'userFills', user } }));
+      for (const addr of previous) if (!next.has(addr)) subscribe('unsubscribe', addr);
+      for (const addr of next) if (!previous.has(addr)) subscribe('subscribe', addr);
+    }
+  }
+  return result;
+}
+
+async function refreshRecommended(scale, testnet = false, account = '') {
+  const saved = JSON.parse(fs.readFileSync(recommendedFile, 'utf8'));
+  scale ??= Number(saved.scale ?? SCALE_SIM);
+  const key = JSON.stringify([scale, testnet, account]);
+  if (!account && !testnet && saved.replay?.reference && saved.replay.maxPositionPct === Number(process.env.HL_MAX_POSITION_PCT || 0.05) &&
+      saved.replay.maxDrawdownPct === saved.maxDrawdownPct && scale === saved.scale && saved.candidates && Date.now() - saved.updatedAt < CACHE_TTL) return saved;
+  if (refreshInFlight) {
+    if (key === refreshKey) return refreshInFlight;
+    await refreshInFlight.catch(() => {});
+    return refreshRecommended(scale, testnet, account);
+  }
+  refreshKey = key;
+  refreshInFlight = findRecommended(scale, testnet, account).finally(() => { refreshInFlight = null; });
+  return refreshInFlight;
+}
+app.get('/api/recommended', (req, res) => {
+  const cfg = JSON.parse(fs.readFileSync(recommendedFile, 'utf8'));
+  res.json(cfg.updatedAt ? cfg : { wallets: [], updatedAt: null });
+});
+app.post('/api/recommended/refresh', async (req, res) => {
+  const scale = Number(req.body?.scale ?? SCALE_SIM);
+  if (!Number.isFinite(scale) || scale <= 0) return res.status(400).json({ error: 'Enter a positive size scale' });
+  try {
+    const configured = process.env.HL_ACCOUNT || '';
+    const account = req.body?.account || (/^0x[0-9a-f]{40}$/i.test(configured) ? configured : '');
+    if (typeof account !== 'string' || (account && !/^0x[0-9a-f]{40}$/i.test(account)))
+      return res.status(400).json({ error: 'Invalid destination account' });
+    const testnet = req.body?.testnet ?? (process.env.HL_TESTNET !== '0');
+    const cfg = await refreshRecommended(scale, testnet, account.toLowerCase());
+    res.json({ ok: true, replay: cfg.replay, wallets: cfg.wallets, candidates: cfg.candidates, checked: cfg.checked, unavailable: cfg.unavailable });
+  }
+  catch (e) { res.status(502).json({ ok: false, error: e.message }); }
 });
 
 // serve frontend
 const pub = path.join(__dirname, '..', 'public');
-app.use(express.static(pub));
+app.use(express.static(pub, { setHeaders: (res, fp) => { if (fp.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate'); } }));
 app.get(/.*/, (req, res) => {
   if (req.path.startsWith('/api')) return res.status(404).end();
   res.sendFile(path.join(pub, 'index.html'));
@@ -725,15 +877,15 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log('Server running on http://localhost:' + PORT);
   // auto-refresh recommended wallets after 60s
-  setTimeout(() => { refreshRecommended().catch(()=>{}); }, 120000);
-  setInterval(() => { refreshRecommended().catch(()=>{}); }, 10 * 60 * 1000);
+  setTimeout(() => { refreshRecommended().catch(e => console.warn('[recommendations]', e.message)); }, 120000);
+  setInterval(() => { refreshRecommended().catch(e => console.warn('[recommendations]', e.message)); }, 10 * 60 * 1000);
   // no periodic summary; only close notifications
   // auto-start sim with recommended wallets via internal call
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(__dirname,'..','config','recommended.json'),'utf8'));
     if (cfg.wallets && cfg.wallets.length) {
       const http = require('http');
-      const body = JSON.stringify({ addresses: cfg.wallets, scale: cfg.scale || 0.001 });
+      const body = JSON.stringify({ addresses: cfg.wallets, useRecommended: true, scale: cfg.scale || 0.001 });
       const req = http.request({ hostname:'localhost', port:PORT, path:'/api/sim/start', method:'POST', headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)} }, (res)=>{ let d=''; res.on('data',c=>d+=c); res.on('end',()=>console.log('[auto] sim start:', d)); });
       req.on('error', e=>console.warn('[auto] sim start err:', e.message));
       req.write(body); req.end();

@@ -100,6 +100,20 @@ hypertrader/
 | `POST /api/mirror/stop` | Stop copy-trading |
 | `GET /api/health` | Health check |
 
+## Finding and copying wallets
+
+Use **Live & Mirror → Find wallets** to screen up to 60 leaderboard accounts with positive weekly, monthly and lifetime PnL. The scan inspects recent perpetual fills and returns up to ten wallets. It requires activity within seven days, at least three active days and five distinct closing orders in the available 30-day sample. The model starts flat, tracks observed entries and proportional exits and marks open positions at their last sampled fill prices. Both realized and marked PnL must stay positive after removing the best closing order and budgeting 9.5 basis points per fill for fees and execution. Replay uses the selected destination network's listed markets and size precision. It sizes each entry against the remaining per-coin position cap using modeled follower equity, rounds down, then checks the $10 minimum. At least half the sampled entry fills must be executable. Drawdown is measured against peak modeled follower equity using the configured drawdown fraction. Qualified wallets are ranked by profit remaining after removing their best closing order, then by lower drawdown. Each wallet is replayed independently from a flat account. An interactive scan uses the destination account's perpetual equity when supplied in the form or server configuration. Scans without an account use the simulator's $10,000 reference balance. The saved shared list uses that reference balance on mainnet. Results describe the available fill sample, which can cover less than 30 days.
+
+Review the addresses, size scale and destination network before starting the mirror. Both destination modes follow mainnet traders. Install the executor dependencies in the Python environment used by the server:
+
+```bash
+python3 -m pip install hyperliquid-python-sdk==0.24.0 websocket-client==1.9.2
+```
+
+The executor records size and position skips to prevent later replay, bounds the entry limit against both the leader's fill and the current destination mid, skips entry signals older than 60 seconds and follows new fills in default perpetual markets. It records confirmed fill quantities by leader, coin, destination network and account under `.cache/mirror-*.sqlite`. Keep this file when restarting. A partial exit closes the same fraction of that leader's copied position. An order below the destination size step or rejected by the exchange contributes zero exposure. Opposing opens are skipped while the account holds the other side. The executor does not import pre-existing positions or reconstruct fills missed while the process was stopped.
+
+If submission succeeds but its acknowledgement is lost, the executor pauses that coin. Check the destination account's order and fill history against the pending trade before resuming that coin. Stopping the mirror leaves existing exchange positions open.
+
 ## VPS Deployment
 
 ```bash
